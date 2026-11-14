@@ -1,0 +1,21 @@
+# 运行时生成的个人数据，绝不入库
+python/auth.json
+python/cookies.txt
+python/state.json
+python/config.json
+python/hot_words.json
+python/logs/
+python/.browser-profile/
+
+# 打包产物
+python/dist/
+python/build/
+python/MSRewards.spec
+python/__pycache__/
+**/__pycache__/
+*.pyc
+
+# 工作区杂项
+.workbuddy/
+Thumbs.db
+desktop.ini
