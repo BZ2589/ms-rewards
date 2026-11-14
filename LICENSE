@@ -1,9 +1,10 @@
 MIT License
 
 Copyright (c) 2024-2026 liyan20001124-byte (original userscript:
-"微软积分商城签到（全能智能重构版）", https://scriptcat.org/zh-CN/script-show-page/6241)
+"微软Rewards积分自动脚本", ScriptCat #6241,
+https://scriptcat.org/zh-CN/script-show-page/6241)
 
-Copyright (c) 2026 <你的名字或 GitHub 用户名> (Python port: MS Rewards 控制台)
+Copyright (c) 2026 BZ2589 (Python port: MS Rewards 控制台)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

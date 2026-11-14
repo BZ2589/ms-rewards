@@ -2,7 +2,7 @@
 
 微软 Microsoft Rewards 每日任务的本地自动化工具：纯 Python 实现，PyQt5 图形界面，无任何第三方运行时依赖（GUI 除外），支持一键登录、守护挂机、打包成单个 exe 分发。
 
-> 本项目移植自 ScriptCat 油猴脚本 [「微软积分商城签到（全能智能重构版）」#6241](https://scriptcat.org/zh-CN/script-show-page/6241)（作者 liyan20001124-byte，MIT 许可），在其逻辑基础上重写为本地桌面程序并扩展了大量调度与界面能力。
+> 本项目移植自 ScriptCat 油猴脚本 [微软Rewards积分自动脚本 #6241](https://scriptcat.org/zh-CN/script-show-page/6241)（作者 liyan20001124-byte，MIT 许可），在其逻辑基础上重写为本地桌面程序并扩展了大量调度与界面能力。
 
 ## 功能
 
