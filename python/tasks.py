@@ -133,6 +133,22 @@ def _stopped(api, label: str) -> bool:
     return False
 
 
+def _notify_wait(api, kind: str) -> None:
+    """告诉 GUI「现在是在等，还是在干活」。
+
+    守护等空闲、任务间隙这些等待可能长达几十分钟，期间界面必须放开
+    （用户可以刷新、可以停止），不然看起来就像卡死了。
+    kind="" 表示等待结束、马上要动手。
+    """
+    hook = getattr(api, "wait_hook", None)
+    if hook is None:
+        return
+    try:
+        hook(kind)
+    except Exception:
+        pass
+
+
 def _idle_gate(api, label: str) -> bool:
     """守护模式专用：等到电脑没人用（默认 5 分钟无键鼠输入）再执行。
 
@@ -158,7 +174,9 @@ def _idle_gate(api, label: str) -> bool:
             api.log("😴", f"仍在等空闲：{idle_guard.human(idle)} / {idle_guard.human(need)}"
                           f"（已等 {idle_guard.human(waited)}）")
 
+    _notify_wait(api, "idle")                       # 开始等空闲：界面放开，可刷新可停止
     ok = idle_guard.wait_until_idle(need, poll, max_wait, api.stopped, tick)
+    _notify_wait(api, "")                           # 等到了/被中断：交还界面控制
     if ok:
         api.log("😴", f"电脑已空闲 {idle_guard.human(idle_guard.idle_seconds())}，"
                       f"开始执行「{label}」")
@@ -187,7 +205,9 @@ def _pace_gap(api, next_label: str) -> bool:
             api.log("⏳", f"为守住整轮时长上限，本轮间隔缩短为 {wait // 60} 分 {wait % 60} 秒")
     api.log("⏳", f"分散节奏：{wait // 60} 分 {wait % 60} 秒后再做「{next_label}」"
                   f"（点「停止」可立即中断）")
+    _notify_wait(api, "gap")                        # 间隙等待：界面放开
     api.sleep(wait * 1000)
+    _notify_wait(api, "")
     return not api.stopped()
 
 

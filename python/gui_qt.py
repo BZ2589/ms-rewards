@@ -560,6 +560,7 @@ class Signals(QObject):
     browser_done = pyqtSignal(dict)          # 一键登录 / 验证结果
     done = pyqtSignal()
     error = pyqtSignal(str)
+    rest = pyqtSignal(bool, str)             # 守护进入/退出「等待」状态（第二个参数=原因）
 def _deep_merge(dst: dict, patch: dict) -> None:
     """递归合并 patch 进 dst（嵌套 dict 逐层合，而不是整层覆盖）。"""
     for k, val in patch.items():
@@ -576,6 +577,12 @@ class App(QMainWindow):
         self.signals = Signals()
         self.stop_event = threading.Event()
         self.running = False
+        # 守护在两轮之间（含睡到次日）时 worker 线程还活着，但界面必须回到可用状态，
+        # 否则整夜 running=True → 按钮全灰、圆环冻结、数据永远不刷新。
+        self._daemon_resting = False
+        self._worker_mode = ""                     # 当前 worker 是哪个模式起的
+        self._hidden_at = 0.0                      # 收进托盘/最小化的时刻
+        self._last_tick_wall = time.time()          # 上次 tick 的墙钟（识别睡眠/休眠）
         self._ui_loading = False                   # 载入配置时屏蔽「改动自动保存」回写
         self.task_vars: dict[str, QCheckBox] = {}
         self.v: dict[str, QWidget] = {}
@@ -840,7 +847,8 @@ class App(QMainWindow):
         self.v["log_keep_days"].setRange(3, 365)
         self.v["log_keep_days"].setValue(7)
         self.v["log_keep_days"].setSuffix(" 天")
-        self.v["log_keep_days"].setFixedWidth(88)
+        self.v["log_keep_days"].setFixedWidth(124)
+        self.v["log_keep_days"].setMinimumHeight(30)
         self.v["log_keep_days"].setToolTip(
             "日志只保留最近 N 天（默认 7）：超过时先删最老的那份，再写当天的\n"
             "只删 logs\\YYYY-MM-DD.log 和 endpoint-test-*.json，其它文件不动")
@@ -1358,6 +1366,7 @@ class App(QMainWindow):
         self.signals.browser.connect(self._on_browser_stage)
         self.signals.browser_done.connect(self._on_browser_done)
         self.signals.done.connect(self._on_done)
+        self.signals.rest.connect(self._on_daemon_rest)
         self.signals.error.connect(lambda m: self._append_log("ERROR", "🔴", m))
         self.signals.check_done.connect(self._on_check_done)
     def _sys(self, msg: str):
@@ -1400,14 +1409,51 @@ class App(QMainWindow):
                    for k in ("refresh", "today_refresh"))
         if not busy:
             self._reset_countdown()
-    def _on_done(self):
+    def _apply_rest_ui(self, reason: str = ""):
+        """守护处于等待状态时的界面：刷新可用，但不能再起第二个 worker。
+
+        reason: sleep=已收工等次日 / idle=等电脑空闲 / gap=任务间隙 / round=等下一轮
+        """
+        hints = {
+            "sleep": "已收工，等次日自动开始",
+            "idle": "等你离开电脑，空闲后才动手",
+            "gap": "任务间隙，稍后继续",
+            "round": "本轮结束，等下一轮",
+        }
         self.running = False
-        self._set_buttons(True)
+        for k, b in self.buttons.items():
+            b.setEnabled(k not in ("dry", "test", "run", "daemon"))
+        self.btn_stop.setVisible(True)
+        self.btn_stop.setEnabled(True)
+        self.statusBar().showMessage(
+            f"🌙 守护待命：{hints.get(reason, '等待中')}（可刷新、可停止）")
+    def _on_daemon_rest(self, resting: bool, reason: str = ""):
+        """后台线程报告「进入/退出等待」。等待期间界面恢复可用，但绝不自动刷新。"""
+        self._daemon_resting = bool(resting)
+        if resting:
+            self._apply_rest_ui(reason)
+        else:
+            self.running = True
+            self._set_buttons(False)
+    def _on_done(self):
+        mode = getattr(self, "_worker_mode", "")
+        self._worker_mode = ""
         for key in ("refresh", "today_refresh"):   # 圆环停转并重新倒计时
             b = self.buttons.get(key)
             if b:
                 b.set_spinning(False)
         self._reset_countdown()
+        if mode in ("check", "today", "notify") and self._daemon_wanted:
+            # 守护还在后台（正在干活或待命），这次只是手动刷新结束：别碰守护状态
+            if self._daemon_resting:
+                self._apply_rest_ui("")
+            else:
+                self.running = True
+                self._set_buttons(False)
+            return
+        self.running = False
+        self._daemon_resting = False
+        self._set_buttons(True)
         if self._daemon_wanted:                    # 守护被停止/异常退出 → 状态复位并落盘
             self._daemon_wanted = False
             self._autosave({"daemon_resume": False})
@@ -1648,11 +1694,18 @@ class App(QMainWindow):
         self.btn_stop.setEnabled(not enabled)
         self.statusBar().showMessage("空闲" if enabled else "⏳ 任务运行中…  可点「停止」中断等待")
     def _start(self, mode: str):
+        if self._daemon_resting and mode in ("dry", "test", "run", "daemon"):
+            QMessageBox.information(
+                self, "守护待命中",
+                "守护进程还在后台待命（已收工，等下次自动开始）。\n"
+                "要手动跑任务，请先点「停止」结束守护。")
+            return
         if self.running:
             QMessageBox.warning(self, "正在运行", "已有任务在运行，请先等待或点「停止」")
             return
         if not self._save_all(True):
             return
+        self._worker_mode = mode
         self.running = True
         self.stop_event.clear()
         self._set_buttons(False)
@@ -1743,8 +1796,11 @@ class App(QMainWindow):
         n = 0
         while not self.stop_event.is_set():
             n += 1
+            self.signals.rest.emit(False, "")   # 新一轮开始：界面切回「运行中」
             self._sys(f"===== 守护第 {n} 轮 =====")
             api = self._make_api(dry_run=False)
+            # 等空闲 / 任务间隙这些长等待里，把界面交还给用户（可刷新、可停止）
+            api.wait_hook = lambda kind: self.signals.rest.emit(bool(kind), kind)
             done_today = False
             slept = False
             try:
@@ -1753,6 +1809,7 @@ class App(QMainWindow):
                 done_today = bool(getattr(api, "goals_done_today", False))
                 if done_today and not self.stop_event.is_set():
                     # 今日目标已完成：不检测空闲、不跑任务，一直睡到明天东八区起床时间
+                    self.signals.rest.emit(True, "sleep")   # 长睡前先放开界面，不然整夜锁死
                     slept = tasks.sleep_until_wake(api)
             finally:
                 api.close()                    # 每轮结束断开，下一轮再重新连
@@ -1762,6 +1819,7 @@ class App(QMainWindow):
             if slept:
                 continue                       # 睡醒了：新的一天，直接进下一轮
             wait = max(60, interval + (random.randint(-jitter, jitter) if jitter else 0))
+            self.signals.rest.emit(True, "round")   # 两轮之间的等待：界面同样放开
             self._sys(f"第 {n} 轮结束，{wait // 60} 分钟后进入下一轮（同样要等电脑空闲）")
             if self.stop_event.wait(wait):
                 break
@@ -1967,8 +2025,12 @@ class App(QMainWindow):
         if t is not None and t.isActive():
             t.stop()
 
-    def _resume_ring(self):
-        """窗口重新露出来：恢复计时，并立刻补一次刷新（60 秒内刚刷过就跳过）。"""
+    def _resume_ring(self, force: bool = False):
+        """窗口重新露出来：恢复计时，并补一次刷新。
+
+        规则：在托盘/最小化里待的时间 > 一个刷新周期（约 5 分钟），数据肯定旧了，
+        直接刷（force 时同理），不再受 60 秒防抖限制——用户从托盘唤回就是想看最新数字。
+        """
         t = getattr(self, "_ring_timer", None)
         if t is None:
             return
@@ -1976,16 +2038,21 @@ class App(QMainWindow):
             t.start(1000)
         if self.running or self.login_busy:
             return                                  # 正在跑任务时本来就不刷
-        if time.time() - getattr(self, "_last_auto_refresh", 0.0) < 60:
+        now = time.time()
+        away = now - self._hidden_at if self._hidden_at else 0.0
+        stale = force or away >= max(120.0, float(getattr(self, "_check_interval", 300)))
+        if not stale and now - getattr(self, "_last_auto_refresh", 0.0) < 60:
             return                                  # 刚刷过，别连着打两次请求
+        self._hidden_at = 0.0
         self._reset_countdown()
-        self._start_auto_refresh()
+        self._start_auto_refresh(force=True)        # 用户主动唤回：允许突破「睡眠期不刷新」
 
     def showEvent(self, ev):
         super().showEvent(ev)
         self._resume_ring()
 
     def hideEvent(self, ev):
+        self._hidden_at = time.time()
         self._pause_ring()
         super().hideEvent(ev)
 
@@ -1993,6 +2060,7 @@ class App(QMainWindow):
         super().changeEvent(ev)
         if ev.type() == QEvent.WindowStateChange:
             if self.isMinimized():
+                self._hidden_at = time.time()
                 self._pause_ring()
             else:
                 self._resume_ring()
@@ -2000,6 +2068,12 @@ class App(QMainWindow):
     def _ring_tick(self):
         """每秒：冻结条件（跑任务 / 等登录 / 正在刷新 / 人不在控制台）时不计时；
         否则推进深蓝弧，画满即自动体检一次。"""
+        # 墙钟跳变 = 电脑睡过/休眠过：定时器停摆了几小时，界面数字必然过期，先补刷
+        now = time.time()
+        jumped = bool(self._last_tick_wall) and (now - self._last_tick_wall) > 90
+        self._last_tick_wall = now
+        if self._daemon_resting:
+            return                                  # 守护睡着：不自动刷新，等用户来操作
         rbtn = self.buttons.get("refresh")
         tbtn = self.buttons.get("today_refresh")
         if (self.running or self.login_busy
@@ -2007,6 +2081,10 @@ class App(QMainWindow):
             return                                  # 冻结：刷新完再从 0 重新走
         if not self._auto_check_allowed():
             return                                  # 人不在控制台页面：圆环冻结，不发请求
+        if jumped:
+            self._reset_countdown()
+            self._start_auto_refresh()
+            return
         self._check_left -= 1
         ratio = 1.0 - self._check_left / max(1, self._check_interval)
         for k in ("refresh", "today_refresh"):
@@ -2014,9 +2092,14 @@ class App(QMainWindow):
         if self._check_left <= 0:
             self._start_auto_refresh()
 
-    def _start_auto_refresh(self):
-        """圆环画满：自动体检一次（状态行 + 今日行），两个圆环同时进入旋转状态。"""
+    def _start_auto_refresh(self, force: bool = False):
+        """圆环画满：自动体检一次（状态行 + 今日行），两个圆环同时进入旋转状态。
+
+        force=True 只给「用户主动唤回窗口」用；守护睡着时绝不自动发请求。
+        """
         if self.running or self.login_busy:
+            return
+        if self._daemon_resting and not force:
             return
         self.buttons["refresh"].set_spinning(True)
         self.buttons["today_refresh"].set_spinning(True)
@@ -2605,6 +2688,44 @@ def main() -> int:
                     errs.append(f"状态项缺失: {k}")
             if "today_refresh" not in win.buttons:
                 errs.append("今日刷新按钮缺失")
+            # 守护待命态：界面要放开刷新、锁住再起 worker、停止按钮可见
+            win.running = True
+            win._set_buttons(False)
+            win._on_daemon_rest(True)
+            QApplication.processEvents()
+            if not win.buttons["refresh"].isEnabled():
+                errs.append("待命态：刷新按钮仍被禁用")
+            if win.buttons["run"].isEnabled() or win.buttons["daemon"].isEnabled():
+                errs.append("待命态：仍可再起一个 worker（应禁用）")
+            if win.btn_stop.isHidden():
+                errs.append("待命态：停止按钮不可见")
+            # 待命期间手动刷新结束，不能把守护状态清掉
+            win._daemon_wanted = True
+            win._worker_mode = "check"
+            win.signals.done.emit()
+            QApplication.processEvents()
+            if not win._daemon_resting:
+                errs.append("待命期间刷新结束误清了守护状态")
+            if win.running:
+                errs.append("待命期间刷新结束未复位运行态")
+            win._daemon_wanted = False
+            # 守护睡着时：任何自动刷新都必须被挡住
+            win._daemon_resting = True
+            win._last_auto_refresh = 0.0
+            win._start_auto_refresh()
+            QApplication.processEvents()
+            if getattr(win.buttons["refresh"], "_spinning", False):
+                errs.append("守护睡着时仍自动刷新（应只有用户操作才刷）")
+            # 托盘闲置超过一个刷新周期 → 必须无视 60 秒防抖，强制补刷一次
+            calls = []
+            win._start_auto_refresh = lambda force=False: calls.append(1)
+            win._hidden_at = time.time() - 3600
+            win._last_auto_refresh = time.time()
+            win.running = False
+            win._resume_ring()
+            if not calls:
+                errs.append("从托盘唤醒（闲置 1 小时）没有补刷")
+            win._daemon_resting = False
             win.signals.done.emit()
             QApplication.processEvents()
             if win.running is not False:
